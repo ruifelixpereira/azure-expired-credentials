@@ -2,6 +2,8 @@
 
 Scripts to find Azure credentials that are about to expire — covering both **Azure AD app registrations** (service principal secrets & certificates) and **App Service SSL/TLS certificates**.
 
+Includes an **Azure Automation + Azure Monitor** stack for scheduled checks with email alerts.
+
 ## Prerequisites
 
 | Tool | Minimum version | Install |
@@ -17,22 +19,27 @@ You must be logged in (`az login`) with appropriate permissions:
 
 | File | Description |
 |------|-------------|
-| `check-expiring-credentials.sh` | Lists AD app registrations with expiring password/cert credentials |
-| `test-check-expiring-credentials.sh` | Tests for the above (mocked `az`, no Azure needed) |
-| `check-expiring-appservice-certs.sh` | Lists App Service SSL/TLS certificates expiring soon |
-| `test-check-expiring-appservice-certs.sh` | Tests for the above (mocked `az`, no Azure needed) |
+| `quick-checks/check-expiring-credentials.sh` | Lists AD app registrations with expiring password/cert credentials |
+| `quick-checks/test-check-expiring-credentials.sh` | Tests for the above (mocked `az`, no Azure needed) |
+| `quick-checks/check-expiring-appservice-certs.sh` | Lists App Service SSL/TLS certificates expiring soon |
+| `quick-checks/test-check-expiring-appservice-certs.sh` | Tests for the above (mocked `az`, no Azure needed) |
+| `automation/main.bicep` | Bicep template — Automation Account, Runbook, Schedule, Log Analytics, Alert Rule |
+| `automation/main.bicepparam` | Bicep parameters file |
+| `automation/runbook-check-expiring-credentials.ps1` | PowerShell runbook (both checks combined) |
+| `automation/deploy.sh` | One-command deployment script |
 
 ## Usage
 
 ```bash
 # Make all scripts executable
-chmod +x check-expiring-credentials.sh check-expiring-appservice-certs.sh \
-         test-check-expiring-credentials.sh test-check-expiring-appservice-certs.sh
+chmod +x quick-checks/*.sh
 ```
 
 ### 1. AD App Registration Credentials
 
 ```bash
+cd quick-checks
+
 # Default: credentials expiring in the next 60 days, table output
 ./check-expiring-credentials.sh
 
@@ -63,6 +70,8 @@ My-Cert-App                              cccc-3333-dddd-4444                    
 ### 2. App Service SSL/TLS Certificates
 
 ```bash
+cd quick-checks
+
 # Default: certs expiring in the next 60 days across all subscriptions
 ./check-expiring-appservice-certs.sh
 
@@ -99,6 +108,7 @@ cert-staging                        rg-web-staging       staging.myapp.com      
 Both test scripts mock the `az` CLI — no Azure subscription is required:
 
 ```bash
+cd quick-checks
 ./test-check-expiring-credentials.sh
 ./test-check-expiring-appservice-certs.sh
 ```
@@ -122,3 +132,76 @@ Both test scripts mock the `az` CLI — no Azure subscription is required:
 - Single-subscription `--subscription` flag
 - Input validation for `--days` and `--output`
 - `--help` flag
+
+## Automated Monitoring (Azure Automation + Azure Monitor)
+
+The `automation/` folder contains everything needed to run the checks on a weekly schedule and get email alerts when credentials are about to expire.
+
+### Architecture
+
+```
+Azure Automation Account (Managed Identity)
+  └─ PowerShell Runbook (weekly schedule)
+       ├─ Scans AD app registrations (secrets + certs)
+       └─ Scans App Service SSL certificates
+            │
+            ▼
+      Log Analytics Workspace
+        (custom table: ExpiringCredentials_CL)
+            │
+            ▼
+      Azure Monitor Scheduled Query Rule
+        → fires when DaysRemaining >= 0
+            │
+            ▼
+      Action Group → Email notification
+```
+
+### Deploy
+
+```bash
+cd automation
+chmod +x deploy.sh
+
+# Minimal — creates all resources in a new resource group
+./deploy.sh --resource-group rg-credential-monitor --email team@example.com
+
+# With options
+./deploy.sh \
+  --resource-group rg-credential-monitor \
+  --location swedencentral \
+  --name-prefix credmon \
+  --days-ahead 90 \
+  --email security@example.com
+```
+
+#### Deploy options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--resource-group` | *(required)* | Resource group name (created if missing) |
+| `--email` | *(required)* | Alert email recipient |
+| `--location` | `eastus` | Azure region |
+| `--name-prefix` | `credcheck` | Resource name prefix |
+| `--days-ahead` | `60` | Days to look ahead |
+| `--workspace-id` | *(new)* | Existing Log Analytics workspace resource ID |
+| `--runbook-uri` | — | URI to hosted .ps1 (skips upload step) |
+
+### Post-deployment steps
+
+After `deploy.sh` completes, it prints commands to finish setup:
+
+1. **Grant the Managed Identity `Directory.Read.All`** (for AD app checks)
+2. **Grant Reader on target subscriptions** (for App Service cert checks)
+3. **Set the Log Analytics shared key** in the encrypted Automation variable
+
+### What gets deployed
+
+| Resource | Purpose |
+|----------|---------|
+| Log Analytics Workspace | Stores `ExpiringCredentials_CL` custom log |
+| Automation Account | Runs the PowerShell runbook on a schedule |
+| PowerShell 7.2 Runbook | Combines AD app + App Service cert checks |
+| Weekly Schedule | Monday 08:00 UTC |
+| Action Group | Email notifications |
+| Scheduled Query Alert Rule | Fires daily when expiring credentials are found in logs |
